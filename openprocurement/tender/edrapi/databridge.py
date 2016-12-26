@@ -34,14 +34,14 @@ class EdrApiDataBridge(object):
         api_server = self.config_get('tenders_api_server')
         api_version = self.config_get('tenders_api_version')
         ro_api_server = self.config_get('public_tenders_api_server') or api_server
-        queue_size = self.config_get('buffers_size') or 500
+        buffers_size = self.config_get('buffers_size') or 500
 
         self.tenders_sync_client = TendersClientSync('', host_url=ro_api_server, api_version=api_version)
         self.client = TendersClient(self.config_get('api_token'), host_url=api_server, api_version=api_version)
-        self.filtered_tenders = Queue(maxsize=queue_size)
-        self.ids_queue = Queue(maxsize=queue_size)
-        self.on_error_delay = self.config_get('on_error_sleep_delay') or 5
+        self.filtered_tenders_queue = Queue(maxsize=buffers_size)
+        self.ids_queue = Queue(maxsize=buffers_size)
         self.initialization_event = gevent.event.Event()
+        self.delay = self.config_get('delay') or 15
 
     def config_get(self, name):
         return self.config.get('main').get(name)
@@ -83,7 +83,7 @@ class EdrApiDataBridge(object):
                     logger.info('Skipping tender {} with status {} with procurementMethodType {}'.format(
                                 tender['id'], tender['status'], tender['procurementMethodType']))
             logger.info('Sleep {} sync...'.format(direction))
-            gevent.sleep(20)
+            gevent.sleep(self.delay)
             response = self.tenders_sync_client.sync_tenders(params,
                                                              extra_headers={'X-Client-Request-ID': generate_req_id()})
 
@@ -93,8 +93,8 @@ class EdrApiDataBridge(object):
         try:
             for tender in self.get_tenders(params=params, direction="forward"):
                 logger.info('Forward sync: Put tender {} to process...'.format(tender['id']))
-                self.filtered_tenders.put(tender['id'])
-        except Exception, e:
+                self.filtered_tenders_queue.put(tender['id'])
+        except Exception as e:
             logger.warn('Forward worker died!')
             logger.exception(e)
         else:
@@ -106,8 +106,8 @@ class EdrApiDataBridge(object):
         try:
             for tender in self.get_tenders(params=params, direction="backward"):
                 logger.info('Backward sync: Put tender {} to process...'.format(tender['id']))
-                self.filtered_tenders.put(tender['id'])
-        except Exception, e:
+                self.filtered_tenders_queue.put(tender['id'])
+        except Exception as e:
             logger.warn('Backward worker died!')
             logger.exception(e)
         else:
@@ -131,13 +131,13 @@ class EdrApiDataBridge(object):
 
         try:
             while True:
-                gevent.sleep(10)
+                gevent.sleep(self.delay)
                 if forward_worker.dead or (backward_worker.dead and not backward_worker.successful()):
                     self._restart_synchronization_workers()
                     backward_worker, forward_worker = self.jobs
         except KeyboardInterrupt:
             logger.info('Exiting...')
-        except Exception, e:
+        except Exception as e:
             logger.error(e)
 
 
