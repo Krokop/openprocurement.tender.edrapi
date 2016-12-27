@@ -14,8 +14,10 @@ import argparse
 from uuid import uuid4
 import gevent
 from openprocurement_client.client import TendersClientSync, TendersClient
+from .client import EdrApiClient
 from yaml import load
 from gevent.queue import Queue
+from requests import HTTPError
 
 logger = logging.getLogger("openprocurement.tender.edrapi.databridge")
 
@@ -41,7 +43,9 @@ class EdrApiDataBridge(object):
         self.filtered_tenders_queue = Queue(maxsize=buffers_size)
         self.ids_queue = Queue(maxsize=buffers_size)
         self.initialization_event = gevent.event.Event()
+        self.too_many_requests_event = gevent.event.Event()
         self.delay = self.config_get('delay') or 15
+        self.edrApiClient = EdrApiClient()
 
     def config_get(self, name):
         return self.config.get('main').get(name)
@@ -86,6 +90,62 @@ class EdrApiDataBridge(object):
             gevent.sleep(self.delay)
             response = self.tenders_sync_client.sync_tenders(params,
                                                              extra_headers={'X-Client-Request-ID': generate_req_id()})
+
+    def get_ids(self):
+        try:
+            tender_id = self.filtered_tenders_queue.get()
+            logger.info('Get tender {} from queue'.format(tender_id))
+            tender = self.tenders_sync_client.get_tender(tender_id,
+                                                         extra_headers={'X-Client-Request-ID': generate_req_id()})['data']
+        except Exception, e:
+            logger.warn('Fail to get tender info {}'.format(tender_id))
+            logger.exception(e)
+            logger.info('Put tender {} back to tenders queue'.format(tender_id))
+            self.filtered_tenders_queue.put(tender_id)
+            gevent.sleep(self.delay)
+        else:
+            if 'awards' in tender:
+                for award in tender['awards']:
+                    logger.info('Processing tender {} award {}'.format(tender['id'], award['id']))
+                    if award['status'] == 'pending':
+                        for supplier in award['suppliers']:
+                            self.ids_queue.put((tender['id'], award['id'], supplier['identifier']['id'], 'award'))
+                    else:
+                        logger.info('tender {} award {} is not in status pending.'.format(tender_id, award['id']))
+            elif 'bids' in tender:
+                for bid in tender['bids']:
+                    # get appropriate qualification id
+                    logger.info('Processing tender {} bid {}'.format(tender['id'], bid['id']))
+                    qualification_id = [q['id'] for q in tender['qualifications'] if q['bidID'] == bid['id']][0]
+                    for tenderer in bid['tenderers']:
+                        self.ids_queue.put((tender['id'], qualification_id, tenderer['identifier']['id'],
+                                            'qualification'))
+
+    def upload_document(self):
+        self.too_many_requests_event.set()
+        try:
+            tender_id, obj_id, code, flag = self.ids_queue.get()
+        except Exception, e:
+            logger.warn('Fail to get tender {} with {} id {} from edrpou queue'.format(tender_id, flag, obj_id))
+            logger.exception(e)
+            logger.info('Put tender {} with {} id {} back to tenders queue'.format(tender_id, flag, obj_id))
+            self.filtered_tenders_queue.put((tender_id, obj_id, code))
+            gevent.sleep(self.delay)
+        else:
+            response = self.edrApiClient.get_by_code(code)
+            response_json = response.json()
+            if response.status_code == 429:
+                self.too_many_requests_event.clear()
+                gevent.sleep(response.headers.get('Retry-After'))
+                self.too_many_requests_event.set()
+            elif response.status_code == 402:
+                logger.info('Payment required for requesting info to EDR.')
+
+            # create patch request to award with document to upload
+            if flag == 'award':
+                self.client.upload_award_document(response_json, tender_id, obj_id)
+            elif flag == 'qualification':
+                self.client.upload_qualification_document(response_json, tender_id, obj_id)
 
     def get_tender_contracts_forward(self):
         logger.info('Start forward data sync worker...')
