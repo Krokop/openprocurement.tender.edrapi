@@ -17,7 +17,7 @@ from openprocurement_client.client import TendersClientSync, TendersClient
 from .client import EdrApiClient
 from yaml import load
 from gevent.queue import Queue
-from requests import HTTPError
+from  collections import namedtuple
 
 logger = logging.getLogger("openprocurement.tender.edrapi.databridge")
 
@@ -43,14 +43,16 @@ class EdrApiDataBridge(object):
         self.filtered_tenders_queue = Queue(maxsize=buffers_size)
         self.ids_queue = Queue(maxsize=buffers_size)
         self.initialization_event = gevent.event.Event()
-        self.too_many_requests_event = gevent.event.Event()
+        self.until_too_many_requests_event = gevent.event.Event()
+        self.until_too_many_requests_event.set()
         self.delay = self.config_get('delay') or 15
-        self.edrApiClient = EdrApiClient()
+        self.edrApiClient = EdrApiClient(self.config.get('edr_api_server'), self.config.get('edr_api_token'))
 
     def config_get(self, name):
         return self.config.get('main').get(name)
 
     def initialize_sync(self, params=None, direction=None):
+        self.initialization_event.clear()
         if direction == "backward":
             assert params['descending']
             response = self.tenders_sync_client.sync_tenders(params, extra_headers={'X-Client-Request-ID': generate_req_id()})
@@ -92,60 +94,73 @@ class EdrApiDataBridge(object):
                                                              extra_headers={'X-Client-Request-ID': generate_req_id()})
 
     def get_ids(self):
-        try:
+        while True:
             tender_id = self.filtered_tenders_queue.get()
-            logger.info('Get tender {} from queue'.format(tender_id))
-            tender = self.tenders_sync_client.get_tender(tender_id,
+            try:
+                logger.info('Get tender {} from queue'.format(tender_id))
+                tender = self.tenders_sync_client.get_tender(tender_id,
                                                          extra_headers={'X-Client-Request-ID': generate_req_id()})['data']
-        except Exception, e:
-            logger.warn('Fail to get tender info {}'.format(tender_id))
-            logger.exception(e)
-            logger.info('Put tender {} back to tenders queue'.format(tender_id))
-            self.filtered_tenders_queue.put(tender_id)
-            gevent.sleep(self.delay)
-        else:
-            if 'awards' in tender:
-                for award in tender['awards']:
-                    logger.info('Processing tender {} award {}'.format(tender['id'], award['id']))
-                    if award['status'] == 'pending':
-                        for supplier in award['suppliers']:
-                            self.ids_queue.put((tender['id'], award['id'], supplier['identifier']['id'], 'award'))
-                    else:
-                        logger.info('tender {} award {} is not in status pending.'.format(tender_id, award['id']))
-            elif 'bids' in tender:
-                for bid in tender['bids']:
-                    # get appropriate qualification id
-                    logger.info('Processing tender {} bid {}'.format(tender['id'], bid['id']))
-                    qualification_id = [q['id'] for q in tender['qualifications'] if q['bidID'] == bid['id']][0]
-                    for tenderer in bid['tenderers']:
-                        self.ids_queue.put((tender['id'], qualification_id, tenderer['identifier']['id'],
-                                            'qualification'))
+            except Exception, e:
+                logger.warn('Fail to get tender info {}'.format(tender_id))
+                logger.exception(e)
+                logger.info('Put tender {} back to tenders queue'.format(tender_id))
+                self.filtered_tenders_queue.put(tender_id)
+                gevent.sleep(self.delay)
+            else:
+                Data = namedtuple('Data', ['tender_id', 'obj_id', 'code', 'obj_type'])
+                if 'awards' in tender:
+                    for award in tender['awards']:
+                        logger.info('Processing tender {} award {}'.format(tender['id'], award['id']))
+                        if award['status'] == 'pending':
+                            for supplier in award['suppliers']:
+                                tender_data = Data(tender['id'], award['id'], supplier['identifier']['id'], 'award')
+                                self.ids_queue.put(tender_data)
+                        else:
+                            logger.info('Tender {} award {} is not in status pending.'.format(tender_id, award['id']))
+                elif 'bids' in tender:
+                    for bid in tender['bids']:
+                        # get appropriate qualification id
+                        logger.info('Processing tender {} bid {}'.format(tender['id'], bid['id']))
+                        qualification_id = [q['id'] for q in tender['qualifications'] if q['bidID'] == bid['id']][0]
+                        for tenderer in bid['tenderers']:
+                            tender_data = Data(tender['id'], qualification_id,
+                                               tenderer['identifier']['id'], 'qualification')
+                            self.ids_queue.put(tender_data)
 
     def upload_document(self):
-        self.too_many_requests_event.set()
-        try:
-            tender_id, obj_id, code, flag = self.ids_queue.get()
-        except Exception, e:
-            logger.warn('Fail to get tender {} with {} id {} from edrpou queue'.format(tender_id, flag, obj_id))
-            logger.exception(e)
-            logger.info('Put tender {} with {} id {} back to tenders queue'.format(tender_id, flag, obj_id))
-            self.filtered_tenders_queue.put((tender_id, obj_id, code))
-            gevent.sleep(self.delay)
-        else:
-            response = self.edrApiClient.get_by_code(code)
-            response_json = response.json()
-            if response.status_code == 429:
-                self.too_many_requests_event.clear()
-                gevent.sleep(response.headers.get('Retry-After'))
-                self.too_many_requests_event.set()
-            elif response.status_code == 402:
-                logger.info('Payment required for requesting info to EDR.')
-
-            # create patch request to award with document to upload
-            if flag == 'award':
-                self.client.upload_award_document(response_json, tender_id, obj_id)
-            elif flag == 'qualification':
-                self.client.upload_qualification_document(response_json, tender_id, obj_id)
+        while True:
+            try:
+                tender = self.ids_queue.get()
+            except Exception, e:
+                logger.warn('Fail to get tender {} with {} id {} from edrpou queue'.format(tender.tender_id,
+                                                                                           tender.obj_type,
+                                                                                           tender.obj_id))
+                logger.exception(e)
+                logger.info('Put tender {} with {} id {} back to tenders queue'.format(tender.tender_id,
+                                                                                       tender.obj_type,
+                                                                                       tender.obj_id))
+                self.filtered_tenders_queue.put((tender.tender_id, tender.obj_id, tender.code))
+                gevent.sleep(self.delay)
+            else:
+                gevent.wait([self.until_too_many_requests_event])
+                response = self.edrApiClient.get_by_code(tender.code)
+                response_json = response.json()
+                if response.status_code == 200:
+                    # create patch request to award with document to upload
+                    if tender.obj_type == 'award':
+                        self.client.upload_award_document(response_json, tender.tender_id, tender.obj_id)
+                    elif tender.obj_type == 'qualification':
+                        self.client.upload_qualification_document(response_json, tender.tender_id, tender.obj_id)
+                elif response.status_code == 429:  # ----------------where are another error that need to be processed
+                    self.until_too_many_requests_event.clear()
+                    gevent.sleep(response.headers.get('Retry-After'))
+                    self.until_too_many_requests_event.set()
+                elif response.status_code == 402:
+                    logger.info('Payment required for requesting info to EDR. '
+                                'Error description: {err}'.format(err=response_json.get('errors')))
+                else:
+                    logger.info('Error appeared while requesting to EDR. '
+                                'Description: {err}'.format(err=response_json.get('errors')))
 
     def get_tender_contracts_forward(self):
         logger.info('Start forward data sync worker...')
@@ -184,9 +199,14 @@ class EdrApiDataBridge(object):
             j.kill()
         self._start_synchronization_workers()
 
+    def _start_steps(self):
+        self.immortal_jobs = {'get_ids': gevent.spawn(self.get_ids),
+                              'upload_file': gevent.spawn(self.upload_document)}
+
     def run(self):
         logger.error('Start EDR API Data Bridge')
         self._start_synchronization_workers()
+        self._start_steps()
         backward_worker, forward_worker = self.jobs
 
         try:
@@ -195,8 +215,15 @@ class EdrApiDataBridge(object):
                 if forward_worker.dead or (backward_worker.dead and not backward_worker.successful()):
                     self._restart_synchronization_workers()
                     backward_worker, forward_worker = self.jobs
+
+                for name, job in self.immortal_jobs.items():
+                    if job.dead:
+                        logger.warn('Restarting {} worker'.format(name))
+                        self.immortal_jobs[name] = gevent.spawn(getattr(self, name))
         except KeyboardInterrupt:
             logger.info('Exiting...')
+            gevent.killall(self.jobs, timeout=5)
+            gevent.killall(self.immortal_jobs, timeout=5)
         except Exception as e:
             logger.error(e)
 
