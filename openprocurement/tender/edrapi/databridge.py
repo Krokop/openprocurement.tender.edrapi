@@ -17,7 +17,10 @@ from openprocurement_client.client import TendersClientSync, TendersClient
 from openprocurement.tender.edrapi.client import EdrApiClient
 from yaml import load
 from gevent.queue import Queue
-from  collections import namedtuple
+from collections import namedtuple
+from openprocurement.tender.edrapi.journal_msg_ids import (
+    DATABRIDGE_INFO, DATABRIDGE_SYNC_SLEEP, DATABRIDGE_GET_TENDER_FROM_QUEUE, DATABRIDGE_TENDER_PROCESS,
+    DATABRIDGE_EMPTY_RESPONSE, DATABRIDGE_WORKER_DIED, DATABRIDGE_RESTART, DATABRIDGE_START)
 
 logger = logging.getLogger("openprocurement.tender.edrapi.databridge")
 Data = namedtuple('Data', ['tender_id', 'obj_id', 'code', 'obj_type'])
@@ -25,6 +28,12 @@ Data = namedtuple('Data', ['tender_id', 'obj_id', 'code', 'obj_type'])
 
 def generate_req_id():
     return b'edr-api-data-bridge-req-' + str(uuid4()).encode('ascii')
+
+
+def journal_context(record={}, params={}):
+    for k, v in params.items():
+        record["JOURNAL_" + k] = v
+    return record
 
 
 class EdrApiDataBridge(object):
@@ -77,7 +86,6 @@ class EdrApiDataBridge(object):
         while not (params.get('descending') and not len(response.data) and params.get('offset') == response.next_page.offset):
             tenders = response and response.data or []
             params['offset'] = response.next_page.offset
-            logger.info('Response with list of tenders, lens {}'.format(len(tenders)))
             for tender in tenders:
                 if (tender['status'] == "active.qualification" and
                     tender['procurementMethodType'] in ('aboveThresholdUA', 'aboveThresholdUA.defense', 'aboveThresholdEU',
@@ -88,38 +96,49 @@ class EdrApiDataBridge(object):
                     yield tender
                 else:
                     logger.info('Skipping tender {} with status {} with procurementMethodType {}'.format(
-                                tender['id'], tender['status'], tender['procurementMethodType']))
-            logger.info('Sleep {} sync...'.format(direction))
+                                tender['id'], tender['status'], tender['procurementMethodType']),
+                                extra=journal_context({"MESSAGE_ID": DATABRIDGE_INFO},
+                                params={"TENDER_ID": tender['id']}))
+            logger.info('Sleep {} sync...'.format(direction), extra=journal_context({"MESSAGE_ID": DATABRIDGE_SYNC_SLEEP}))
             gevent.sleep(self.delay)
             response = self.tenders_sync_client.sync_tenders(params,
                                                              extra_headers={'X-Client-Request-ID': generate_req_id()})
 
-    def get_ids(self):
+    def prepare_data(self):
         while True:
             tender_id = self.filtered_tenders_queue.get()
             try:
-                logger.info('Get tender {} from filtered_tenders_queue'.format(tender_id))
                 tender = self.tenders_sync_client.get_tender(
                                             tender_id, extra_headers={'X-Client-Request-ID': generate_req_id()})['data']
+                logger.info('Get tender {} from filtered_tenders_queue'.format(tender_id),
+                            extra=journal_context({"MESSAGE_ID": DATABRIDGE_GET_TENDER_FROM_QUEUE},
+                            params={"TENDER_ID": tender['id']}))
             except Exception, e:
-                logger.warn('Fail to get tender info {}'.format(tender_id))
+                logger.warn('Fail to get tender info {}'.format(tender_id),
+                            extra=journal_context(params={"TENDER_ID": tender['id']}))
                 logger.exception(e)
-                logger.info('Put tender {} back to tenders queue'.format(tender_id))
+                logger.info('Put tender {} back to tenders queue'.format(tender_id),
+                            extra=journal_context(params={"TENDER_ID": tender['id']}))
                 self.filtered_tenders_queue.put(tender_id)
             else:
                 if 'awards' in tender:
                     for award in tender['awards']:
-                        logger.info('Processing tender {} award {}'.format(tender['id'], award['id']))
+                        logger.info('Processing tender {} award {}'.format(tender['id'], award['id']),
+                                    extra=journal_context({"MESSAGE_ID": DATABRIDGE_TENDER_PROCESS},
+                                    params={"TENDER_ID": tender['id']}))
                         if award['status'] == 'pending':
                             for supplier in award['suppliers']:
                                 tender_data = Data(tender['id'], award['id'], supplier['identifier']['id'], 'award')
                                 self.data_queue.put(tender_data)
                         else:
-                            logger.info('Tender {} award {} is not in status pending.'.format(tender_id, award['id']))
+                            logger.info('Tender {} award {} is not in status pending.'.format(tender_id, award['id']),
+                                        extra=journal_context(params={"TENDER_ID": tender['id']}))
                 elif 'bids' in tender:
                     for bid in tender['bids']:
                         # get appropriate qualification id
-                        logger.info('Processing tender {} bid {}'.format(tender['id'], bid['id']))
+                        logger.info('Processing tender {} bid {}'.format(tender['id'], bid['id']),
+                                    extra=journal_context({"MESSAGE_ID": DATABRIDGE_TENDER_PROCESS},
+                                    params={"TENDER_ID": tender['id']}))
                         qualification_id = [q['id'] for q in tender['qualifications'] if q['bidID'] == bid['id']][0]
                         for tenderer in bid['tenderers']:
                             tender_data = Data(tender['id'], qualification_id,
@@ -130,15 +149,17 @@ class EdrApiDataBridge(object):
         while True:
             try:
                 tender = self.data_queue.get()
-                logger.info('Get tender {} from data_queue'.format(tender.tender_id))
+                logger.info('Get tender {} from data_queue'.format(tender.tender_id),
+                            extra=journal_context({"MESSAGE_ID": DATABRIDGE_GET_TENDER_FROM_QUEUE},
+                                                  params={"TENDER_ID": tender.tender_id}))
             except Exception, e:
-                logger.warn('Fail to get tender {} with {} id {} from edrpou queue'.format(tender.tender_id,
-                                                                                           tender.obj_type,
-                                                                                           tender.obj_id))
+                logger.warn('Fail to get tender {} with {} id {} from edrpou queue'.format(
+                            tender.tender_id, tender.obj_type, tender.obj_id),
+                            extra=journal_context(params={"TENDER_ID": tender.tender_id}))
                 logger.exception(e)
-                logger.info('Put tender {} with {} id {} back to tenders queue'.format(tender.tender_id,
-                                                                                       tender.obj_type,
-                                                                                       tender.obj_id))
+                logger.info('Put tender {} with {} id {} back to tenders queue'.format(
+                            tender.tender_id, tender.obj_type, tender.obj_id),
+                            extra=journal_context(params={"TENDER_ID": tender.tender_id}))
                 self.filtered_tenders_queue.put((tender.tender_id, tender.obj_id, tender.code))
                 gevent.sleep(self.delay)
             else:
@@ -158,56 +179,64 @@ class EdrApiDataBridge(object):
                         self.until_too_many_requests_event.set()
                     elif response.status_code == 402:
                         logger.info('Payment required for requesting info to EDR. '
-                                    'Error description: {err}'.format(err=response_json.get('errors')))
+                                    'Error description: {err}'.format(err=response_json.get('errors')),
+                                    extra=journal_context(params={"TENDER_ID": tender.tender_id}))
                     else:
                         logger.info('Error appeared while requesting to EDR. '
-                                    'Description: {err}'.format(err=response_json.get('errors')))
+                                    'Description: {err}'.format(err=response_json.get('errors')),
+                                    extra=journal_context(params={"TENDER_ID": tender.tender_id}))
                 else:
-                    logger.info('Response for {} and obj id {} is empty'.format(tender.tender_id, tender.obj_id))
+                    logger.info('Response for {} and obj id {} is empty'.format(tender.tender_id, tender.obj_id),
+                                extra=journal_context({"MESSAGE_ID": DATABRIDGE_EMPTY_RESPONSE},
+                                                      params={"TENDER_ID": tender.tender_id}))
 
-    def get_tender_contracts_forward(self):
+    def get_tenders_forward(self):
         logger.info('Start forward data sync worker...')
         params = {'opt_fields': 'status,procurementMethodType', 'mode': '_all_'}
         try:
             for tender in self.get_tenders(params=params, direction="forward"):
-                logger.info('Forward sync: Put tender {} to process...'.format(tender['id']))
+                logger.info('Forward sync: Put tender {} to process...'.format(tender['id']),
+                            extra=journal_context({"MESSAGE_ID": DATABRIDGE_TENDER_PROCESS},
+                                                  {"TENDER_ID": tender['id']}))
                 self.filtered_tenders_queue.put(tender['id'])
         except Exception as e:
-            logger.warn('Forward worker died!')
+            logger.warn('Forward worker died!', extra=journal_context({"MESSAGE_ID": DATABRIDGE_WORKER_DIED}, {}))
             logger.exception(e)
         else:
             logger.warn('Forward data sync finished!')
 
-    def get_tender_contracts_backward(self):
+    def get_tenders_backward(self):
         logger.info('Start backward data sync worker...')
         params = {'opt_fields': 'status,procurementMethodType', 'descending': 1, 'mode': '_all_'}
         try:
             for tender in self.get_tenders(params=params, direction="backward"):
-                logger.info('Backward sync: Put tender {} to process...'.format(tender['id']))
+                logger.info('Backward sync: Put tender {} to process...'.format(tender['id']),
+                            extra=journal_context({"MESSAGE_ID": DATABRIDGE_TENDER_PROCESS},
+                                                  {"TENDER_ID": tender['id']}))
                 self.filtered_tenders_queue.put(tender['id'])
         except Exception as e:
-            logger.warn('Backward worker died!')
+            logger.warn('Backward worker died!', extra=journal_context({"MESSAGE_ID": DATABRIDGE_WORKER_DIED}, {}))
             logger.exception(e)
         else:
             logger.info('Backward data sync finished.')
 
     def _start_synchronization_workers(self):
         logger.info('Starting forward and backward sync workers')
-        self.jobs = [gevent.spawn(self.get_tender_contracts_backward),
-                     gevent.spawn(self.get_tender_contracts_forward)]
+        self.jobs = [gevent.spawn(self.get_tenders_backward),
+                     gevent.spawn(self.get_tenders_forward)]
 
     def _restart_synchronization_workers(self):
-        logger.warn("Restarting synchronization")
+        logger.warn('Restarting synchronization', extra=journal_context({"MESSAGE_ID": DATABRIDGE_RESTART}, {}))
         for j in self.jobs:
             j.kill()
         self._start_synchronization_workers()
 
     def _start_steps(self):
-        self.immortal_jobs = {'get_ids': gevent.spawn(self.get_ids),
+        self.immortal_jobs = {'prepare_data': gevent.spawn(self.prepare_data),
                               'upload_document': gevent.spawn(self.upload_document)}
 
     def run(self):
-        logger.error('Start EDR API Data Bridge')
+        logger.error('Start EDR API Data Bridge', extra=journal_context({"MESSAGE_ID": DATABRIDGE_START}, {}))
         self._start_synchronization_workers()
         self._start_steps()
         backward_worker, forward_worker = self.jobs

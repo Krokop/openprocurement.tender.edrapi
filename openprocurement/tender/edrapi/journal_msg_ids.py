@@ -21,3 +21,5 @@ DATABRIDGE_WORKER_DIED = "c_bridge_worker_died"
 DATABRIDGE_EXCEPTION = "c_bridge_exception"
 DATABRIDGE_CACHED = "c_bridge_cached"
 DATABRIDGE_INFO = "c_bridge_info"
+DATABRIDGE_GET_TENDER_FROM_QUEUE = 'c_databridge_get_tender_from_queue'
+DATABRIDGE_EMPTY_RESPONSE = 'c_databridge_empty_response'
