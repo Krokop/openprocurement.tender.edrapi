@@ -14,12 +14,13 @@ import argparse
 from uuid import uuid4
 import gevent
 from openprocurement_client.client import TendersClientSync, TendersClient
-from .client import EdrApiClient
+from openprocurement.tender.edrapi.client import EdrApiClient
 from yaml import load
 from gevent.queue import Queue
 from  collections import namedtuple
 
 logger = logging.getLogger("openprocurement.tender.edrapi.databridge")
+Data = namedtuple('Data', ['tender_id', 'obj_id', 'code', 'obj_type'])
 
 
 def generate_req_id():
@@ -41,12 +42,12 @@ class EdrApiDataBridge(object):
         self.tenders_sync_client = TendersClientSync('', host_url=ro_api_server, api_version=api_version)
         self.client = TendersClient(self.config_get('api_token'), host_url=api_server, api_version=api_version)
         self.filtered_tenders_queue = Queue(maxsize=buffers_size)
-        self.ids_queue = Queue(maxsize=buffers_size)
+        self.data_queue = Queue(maxsize=buffers_size)
         self.initialization_event = gevent.event.Event()
         self.until_too_many_requests_event = gevent.event.Event()
         self.until_too_many_requests_event.set()
         self.delay = self.config_get('delay') or 15
-        self.edrApiClient = EdrApiClient(self.config.get('edr_api_server'), self.config.get('edr_api_token'))
+        self.edrApiClient = EdrApiClient(self.config_get('edr_api_server'), self.config_get('edr_api_token'))
 
     def config_get(self, name):
         return self.config.get('main').get(name)
@@ -97,24 +98,22 @@ class EdrApiDataBridge(object):
         while True:
             tender_id = self.filtered_tenders_queue.get()
             try:
-                logger.info('Get tender {} from queue'.format(tender_id))
-                tender = self.tenders_sync_client.get_tender(tender_id,
-                                                         extra_headers={'X-Client-Request-ID': generate_req_id()})['data']
+                logger.info('Get tender {} from filtered_tenders_queue'.format(tender_id))
+                tender = self.tenders_sync_client.get_tender(
+                                            tender_id, extra_headers={'X-Client-Request-ID': generate_req_id()})['data']
             except Exception, e:
                 logger.warn('Fail to get tender info {}'.format(tender_id))
                 logger.exception(e)
                 logger.info('Put tender {} back to tenders queue'.format(tender_id))
                 self.filtered_tenders_queue.put(tender_id)
-                gevent.sleep(self.delay)
             else:
-                Data = namedtuple('Data', ['tender_id', 'obj_id', 'code', 'obj_type'])
                 if 'awards' in tender:
                     for award in tender['awards']:
                         logger.info('Processing tender {} award {}'.format(tender['id'], award['id']))
                         if award['status'] == 'pending':
                             for supplier in award['suppliers']:
                                 tender_data = Data(tender['id'], award['id'], supplier['identifier']['id'], 'award')
-                                self.ids_queue.put(tender_data)
+                                self.data_queue.put(tender_data)
                         else:
                             logger.info('Tender {} award {} is not in status pending.'.format(tender_id, award['id']))
                 elif 'bids' in tender:
@@ -125,12 +124,13 @@ class EdrApiDataBridge(object):
                         for tenderer in bid['tenderers']:
                             tender_data = Data(tender['id'], qualification_id,
                                                tenderer['identifier']['id'], 'qualification')
-                            self.ids_queue.put(tender_data)
+                            self.data_queue.put(tender_data)
 
     def upload_document(self):
         while True:
             try:
-                tender = self.ids_queue.get()
+                tender = self.data_queue.get()
+                logger.info('Get tender {} from data_queue'.format(tender.tender_id))
             except Exception, e:
                 logger.warn('Fail to get tender {} with {} id {} from edrpou queue'.format(tender.tender_id,
                                                                                            tender.obj_type,
@@ -145,22 +145,25 @@ class EdrApiDataBridge(object):
                 gevent.wait([self.until_too_many_requests_event])
                 response = self.edrApiClient.get_by_code(tender.code)
                 response_json = response.json()
-                if response.status_code == 200:
-                    # create patch request to award with document to upload
-                    if tender.obj_type == 'award':
-                        self.client.upload_award_document(response_json, tender.tender_id, tender.obj_id)
-                    elif tender.obj_type == 'qualification':
-                        self.client.upload_qualification_document(response_json, tender.tender_id, tender.obj_id)
-                elif response.status_code == 429:  # ----------------where are another error that need to be processed
-                    self.until_too_many_requests_event.clear()
-                    gevent.sleep(response.headers.get('Retry-After'))
-                    self.until_too_many_requests_event.set()
-                elif response.status_code == 402:
-                    logger.info('Payment required for requesting info to EDR. '
-                                'Error description: {err}'.format(err=response_json.get('errors')))
+                if response_json:
+                    if response.status_code == 200:
+                        # create patch request to award with document to upload
+                        if tender.obj_type == 'award':
+                            self.client.upload_award_document(response_json, tender.tender_id, tender.obj_id)
+                        elif tender.obj_type == 'qualification':
+                            self.client.upload_qualification_document(response_json, tender.tender_id, tender.obj_id)
+                    elif response.status_code == 429:
+                        self.until_too_many_requests_event.clear()
+                        gevent.sleep(response.headers.get('Retry-After'))
+                        self.until_too_many_requests_event.set()
+                    elif response.status_code == 402:
+                        logger.info('Payment required for requesting info to EDR. '
+                                    'Error description: {err}'.format(err=response_json.get('errors')))
+                    else:
+                        logger.info('Error appeared while requesting to EDR. '
+                                    'Description: {err}'.format(err=response_json.get('errors')))
                 else:
-                    logger.info('Error appeared while requesting to EDR. '
-                                'Description: {err}'.format(err=response_json.get('errors')))
+                    logger.info('Response for {} and obj id {} is empty'.format(tender.tender_id, tender.obj_id))
 
     def get_tender_contracts_forward(self):
         logger.info('Start forward data sync worker...')
@@ -201,7 +204,7 @@ class EdrApiDataBridge(object):
 
     def _start_steps(self):
         self.immortal_jobs = {'get_ids': gevent.spawn(self.get_ids),
-                              'upload_file': gevent.spawn(self.upload_document)}
+                              'upload_document': gevent.spawn(self.upload_document)}
 
     def run(self):
         logger.error('Start EDR API Data Bridge')
